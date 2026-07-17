@@ -1,0 +1,114 @@
+name: Sync GEOFlow fork
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-geoflow-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Fast-forward GEOFlow main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check target repository token
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Missing repository secret FORK_SYNC_TOKEN."
+            exit 1
+          fi
+
+          gh auth status --hostname github.com
+
+      - name: Synchronize target main with upstream main
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          work_dir="${RUNNER_TEMP}/geoflow-sync"
+          mkdir -p "${work_dir}"
+          cd "${work_dir}"
+
+          gh auth setup-git
+          git clone --branch main --single-branch             https://github.com/zacharydigital/GEOFlow.git GEOFlow
+
+          cd GEOFlow
+          git remote add upstream https://github.com/yaojingang/GEOFlow.git
+          git fetch --no-tags upstream main
+          git merge --ff-only upstream/main
+          git push origin main
+
+          target_sha="$(git rev-parse main)"
+          upstream_sha="$(git rev-parse upstream/main)"
+
+          if [[ "${target_sha}" != "${upstream_sha}" ]]; then
+            echo "::error::Verification failed: target main does not equal upstream main."
+            exit 1
+          fi
+
+          {
+            echo "## GEOFlow synchronization"
+            echo
+            echo "- Target: \`zacharydigital/GEOFlow:main\`"
+            echo "- Upstream: \`yaojingang/GEOFlow:main\`"
+            echo "- Commit: \`${target_sha}\`"
+            echo "- Result: target and upstream are identical"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  keepalive:
+    name: Keep scheduled workflow active
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out automation repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Record monthly activity for this public repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$(date -u +%d)" != "01" ]]; then
+            echo "Keepalive is only written on the first UTC day of each month."
+            exit 0
+          fi
+
+          month="$(date -u +%Y-%m)"
+          state_file=".github/last-keepalive"
+
+          if [[ -f "${state_file}" ]] && grep -qx "${month}" "${state_file}"; then
+            echo "Keepalive for ${month} already exists."
+            exit 0
+          fi
+
+          printf '%s\n' "${month}" > "${state_file}"
+          git add "${state_file}"
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Keep scheduled sync active for ${month}"
+          git pull --rebase origin main
+          git push origin HEAD:main
